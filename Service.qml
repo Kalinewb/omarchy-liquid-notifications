@@ -66,21 +66,47 @@ Item {
     id: persisted
     reloadableId: "omarchy-notifications"
     property bool doNotDisturb: false
+    // Which screen corner the popup stack grows out of: "left", "center", or
+    // "right" (default -- keep in sync with NotificationLogic.js's
+    // POPUP_CORNERS; not read from there directly because
+    // PersistentProperties evaluates its property initializers in a context
+    // where the JS module import isn't reliably resolved yet, which surfaced
+    // as a silent "Unable to assign [undefined] to QString" on reload).
+    // Purely cosmetic -- unlike doNotDisturb it never needs a DND-style
+    // bypass, just somewhere for the Dynamic-Island-style toasts to be
+    // anchored to.
+    property string popupCorner: "right"
     onDoNotDisturbChanged: {
       // Suppress the write that load-time hydration would otherwise trigger.
       if (service._hydrating) return
       service.scheduleSettingsSave()
     }
+    onPopupCornerChanged: {
+      if (service._hydrating) return
+      service.scheduleSettingsSave()
+    }
   }
 
-  // Guards onDoNotDisturbChanged while we're hydrating from disk so the
-  // hydration assignment doesn't immediately schedule a write-back.
+  // Guards onDoNotDisturbChanged/onPopupCornerChanged while we're hydrating
+  // from disk so the hydration assignment doesn't immediately schedule a
+  // write-back.
   property bool _hydrating: false
 
   readonly property alias doNotDisturb: persisted.doNotDisturb
+  readonly property alias popupCorner: persisted.popupCorner
 
   function setDoNotDisturb(value) {
     persisted.doNotDisturb = !!value
+  }
+
+  // Only "left", "center", "right" are accepted; anything else is ignored
+  // rather than persisting a corner the layout code below doesn't know how
+  // to draw.
+  function setPopupCorner(value) {
+    var corner = String(value || "")
+    if (!NotificationLogic.isValidPopupCorner(corner)) return false
+    persisted.popupCorner = corner
+    return true
   }
 
   // popupModel feeds the on-screen toast stack — the only model the service
@@ -820,6 +846,11 @@ Item {
       persisted.doNotDisturb = parsed.dnd
       service._hydrating = false
     }
+    if (parsed.corner !== null) {
+      service._hydrating = true
+      persisted.popupCorner = parsed.corner
+      service._hydrating = false
+    }
 
     service.settingsLoaded = true
     // Versions before the history moved into its own directory kept every
@@ -829,7 +860,11 @@ Item {
   }
 
   function flushSettings() {
-    settingsFile.setText(JSON.stringify({ version: 3, dnd: persisted.doNotDisturb }, null, 2) + "\n")
+    settingsFile.setText(JSON.stringify({
+      version: 3,
+      dnd: persisted.doNotDisturb,
+      corner: persisted.popupCorner
+    }, null, 2) + "\n")
   }
 
   Component.onCompleted: {
@@ -875,6 +910,20 @@ Item {
 
     function isDnd(): string {
       return dndState()
+    }
+
+    // Which screen corner the popup stack grows out of: "left", "center", or
+    // "right".
+    function getCorner(): string {
+      return service.popupCorner
+    }
+
+    // Returns the corner now in effect, same as getCorner -- including when
+    // an invalid value was passed, so a caller can tell the difference
+    // between "changed" and "ignored" without a separate error path.
+    function setCorner(value: string): string {
+      service.setPopupCorner(value)
+      return service.popupCorner
     }
 
     // Replay the notifications that have been moved into the history dir.
@@ -979,22 +1028,37 @@ Item {
 
       ColumnLayout {
         id: popupColumn
-        anchors.right: parent.right
         anchors.top: parent.top
         anchors.topMargin: popupWindow.popupPlacement.margins.top
-        anchors.rightMargin: popupWindow.popupPlacement.margins.right
+        // Horizontal position is driven by service.popupCorner (left/center/
+        // right, user-configurable -- see Service.setPopupCorner) rather
+        // than a fixed anchors.right, so the whole stack -- and each card's
+        // Dynamic-Island-style growth corner below -- can move to any edge.
+        // ColumnLayout doesn't bind its own width to implicitWidth when it
+        // isn't filling its parent on both sides, so that's set explicitly.
+        width: implicitWidth
+        x: {
+          if (service.popupCorner === "left") return popupWindow.popupPlacement.margins.left
+          if (service.popupCorner === "center") return Math.round((popupWindow.width - width) / 2)
+          return popupWindow.width - width - popupWindow.popupPlacement.margins.right
+        }
         spacing: Style.space(8)
 
         Repeater {
           model: popupModel
 
           // The delegate is a slot Item that owns lifetime timer state and the
-          // liquid-drip entrance/exit animation. The Canvas paints the
-          // falling/landing blob; the real NotificationCard (popupMode: true,
-          // so it renders pitch black regardless of the active theme) fades
-          // in once the blob has mostly landed. The history panel
-          // instantiates NotificationCard directly and never runs any of
-          // this -- only the live popup toast drips.
+          // entrance/exit animation. The Canvas paints a Dynamic-Island-style
+          // shape: it grows outward from a fixed, flush corner of the card's
+          // own footprint (see service.popupCorner) rather than falling,
+          // dripping, or oozing in from somewhere else -- that corner reads
+          // as part of the screen edge itself, never moving, never rounded,
+          // for as long as the card is on screen. On exit it shrinks back
+          // down into that same corner. The real NotificationCard
+          // (popupMode: true, so it renders pitch black regardless of the
+          // active theme) fades in once the shape is mostly at full size.
+          // The history panel instantiates NotificationCard directly and
+          // never runs any of this -- only the live popup toast does.
           delegate: Item {
             id: cardSlot
             required property int index
@@ -1010,20 +1074,29 @@ Item {
 
             // Each card sizes itself based on mode (text vs media); the slot
             // tracks the card so the column auto-fits to whichever is widest.
+            // Alignment within that shared width follows the same corner as
+            // the column's own position (a narrower card in a "left" stack
+            // hugs the left edge, not the right).
             Layout.preferredWidth: card.implicitWidth
-            Layout.alignment: Qt.AlignRight
+            Layout.alignment: service.popupCorner === "left" ? Qt.AlignLeft
+              : service.popupCorner === "center" ? Qt.AlignHCenter : Qt.AlignRight
             implicitHeight: card.implicitHeight
 
             readonly property real lifetime: service.durationFor(cardSlot.urgency, cardSlot.expireTimeout)
             property real remainingLifetime: 1.0
             readonly property bool ticking: cardSlot.lifetime > 0 && !card.hovered && !cardSlot.exiting
 
-            // ---- liquid-drip animation state ----
-            // dripProgress: 0 = nothing on screen yet, 1 = fully landed and
-            // settled. Entrance eases past 1 (elastic overshoot) for a bit of
-            // jelly wobble as the drop "lands"; exit runs the same property
-            // back down to 0 with a sharper, non-elastic ease so the toast
-            // reads as retracting rather than re-dripping in reverse.
+            // ---- Dynamic-Island-style entrance/exit state ----
+            // dripProgress: 0 = collapsed to nothing at the anchor corner,
+            // 1 = fully expanded and settled. The corner itself (whichever
+            // one service.popupCorner picks) never moves -- the shape grows
+            // outward from it, like that corner of the screen is what's
+            // expanding, and shrinks back into it on the way out. Kept the
+            // name dripProgress rather than renaming it -- it is still the
+            // single progress value driving the shape in Canvas below, this
+            // plugin's history just went through a few design passes on top
+            // of it (literal drip -> connected icicle -> oozing extrusion ->
+            // Dynamic Island) before landing here.
             property real dripProgress: 0
             property bool exiting: false
             property string pendingAction: "dismiss"
@@ -1044,43 +1117,38 @@ Item {
               NumberAnimation { duration: 220; easing.type: Easing.OutCubic }
             }
 
-            // Two stages, not one elastic tween over the whole range: a
-            // single OutElastic from 0->1 rises almost all the way within
-            // its first ~20% of duration (that is what the easing curve
-            // does), so the neck/blob growth would be over before it is
-            // visible. Stretching down and widening instead gets its own
-            // slower, steady ease, and the elastic wobble is confined to a
-            // short final hop so it reads as a landing bounce, not the
-            // entire fall.
-            SequentialAnimation {
+            // A fast, slightly springy expand -- like iOS's Dynamic Island,
+            // not a bouncy water-droplet wobble (the original design's
+            // OutElastic landing bounce read as a cartoon liquid-physics
+            // gag) and not a slow, heavily-eased drift either. OutBack with
+            // a modest overshoot gives exactly that: a quick expand that
+            // slightly overshoots its final size and settles, all inside
+            // ~420ms -- long enough to be genuinely visible (unlike the
+            // original's OutCubic, which front-loaded ~90% of its motion
+            // into the first ~100ms of an 800ms duration, so a burst of
+            // ~90ms-apart screenshots only ever caught "before" and
+            // "after") without the old design's much longer 800ms hang time,
+            // which no longer suits a snappy corner-grown shape.
+            NumberAnimation {
               id: enterAnim
-              NumberAnimation {
-                target: cardSlot
-                property: "dripProgress"
-                from: 0
-                to: 0.82
-                duration: 420
-                easing.type: Easing.OutCubic
-              }
-              NumberAnimation {
-                target: cardSlot
-                property: "dripProgress"
-                to: 1
-                duration: 380
-                easing.type: Easing.OutElastic
-                easing.amplitude: 0.7
-                easing.period: 0.35
-              }
+              target: cardSlot
+              property: "dripProgress"
+              from: 0
+              to: 1
+              duration: 420
+              easing.type: Easing.OutBack
+              easing.overshoot: 1.3
             }
 
+            // Contracting back to the corner is a plain, un-springy ease --
+            // the reverse of the expand, not a bounce on the way in.
             NumberAnimation {
               id: exitAnim
               target: cardSlot
               property: "dripProgress"
               to: 0
-              duration: 240
-              easing.type: Easing.InBack
-              easing.overshoot: 1.1
+              duration: 220
+              easing.type: Easing.InOutCubic
               onFinished: {
                 if (cardSlot.pendingAction === "invoke") service.invokePopupDefault(cardSlot.index)
                 else if (cardSlot.pendingAction === "expire") service.expirePopup(cardSlot.index)
@@ -1125,17 +1193,23 @@ Item {
               }
             }
 
-            // Pitch-black liquid blob: draws the falling neck/teardrop while
-            // dripProgress climbs toward 1, converging on the exact same
-            // rounded-rect footprint NotificationCard settles into. Always a
-            // literal #000000 fill -- never a theme token -- so it can never
-            // pick up whatever the active Omarchy theme happens to be. Left
-            // permanently underneath the card (rather than toggled via
-            // `visible`) so there is nothing to flicker once the two shapes
-            // converge -- the card simply fades in on top of it.
+            // Pitch-black Dynamic-Island-style shape: grows outward from a
+            // fixed, flush corner of the card's own footprint -- the corner
+            // matching service.popupCorner (top-right by default, so the
+            // shape's top-right point never moves and has no corner radius
+            // of its own, reading as if that corner of the screen is what's
+            // expanding) rather than a card falling into place from
+            // somewhere else. The other corners round from a small pill/dot
+            // at rest size up to the card's real corner radius as it grows.
+            // Always a literal #000000 fill -- never a theme token -- so it
+            // can never pick up whatever the active Omarchy theme happens to
+            // be. Left permanently underneath the card (rather than toggled
+            // via `visible`) so there is nothing to flicker once the two
+            // shapes converge -- the card simply fades in on top of it.
             Canvas {
               id: dripCanvas
               anchors.fill: parent
+
               property real p: cardSlot.dripProgress
               onPChanged: requestPaint()
               onWidthChanged: requestPaint()
@@ -1147,44 +1221,61 @@ Item {
                 var w = width
                 var h = height
                 if (w <= 0 || h <= 0) return
-                var pc = Math.max(-0.2, Math.min(1.3, p))
-                // Growth: the neck reaches full card height quickly.
-                var growP = Math.max(0, Math.min(1, pc / 0.4))
-                // Bulge: the neck widens into the full card footprint and the
-                // pill-like radius relaxes into the card's real corner radius.
-                var bulgeP = Math.max(0, Math.min(1, (pc - 0.32) / 0.68))
-                var curH = h * growP
-                if (curH <= 0.5) return
-                var minNeck = Math.min(14, w)
-                var curW = minNeck + (w - minNeck) * Math.pow(bulgeP, 1.6)
-                if (curW <= 0.5) return
+                // Entrance can overshoot slightly past 1 (OutBack's spring);
+                // clamp the drawn size at the card's actual footprint so
+                // that pop reads as a spring in the corner radius/timing
+                // rather than spilling outside the card's own allocated
+                // space. Exit never goes below 0.
+                var sizeP = Math.max(0, Math.min(1, p))
+                var minNub = Math.min(24, w, h)
+                var curW = minNub + (w - minNub) * sizeP
+                var curH = minNub + (h - minNub) * sizeP
+                if (curW <= 0.5 || curH <= 0.5) return
+
                 var finalR = Math.max(0, service.cornerRadius)
                 var capsuleR = Math.min(curW, curH) / 2
-                var radius = capsuleR + (finalR - capsuleR) * Math.pow(bulgeP, 2.2)
-                var r = Math.max(0, Math.min(radius, curW / 2, curH / 2))
-                var cx = w / 2
-                var left = cx - curW / 2
-                var right = cx + curW / 2
+                var freeR = capsuleR + (finalR - capsuleR) * Math.pow(sizeP, 2.2)
+                freeR = Math.max(0, Math.min(freeR, curW / 2, curH / 2))
+
+                var corner = service.popupCorner
                 var top = 0
                 var bottom = curH
-                // Teardrop belly: while still mostly neck, bow the sides out
-                // a little below the midpoint for a liquid, not mechanical,
-                // silhouette.
-                var belly = (1 - bulgeP) * Math.min(curW * 0.6, 10) * growP
+                var left, right
+                if (corner === "center") {
+                  var cx = w / 2
+                  left = cx - curW / 2
+                  right = cx + curW / 2
+                } else if (corner === "left") {
+                  left = 0
+                  right = curW
+                } else {
+                  right = w
+                  left = right - curW
+                }
+
+                // The corner(s) touching the true top edge (and, for left/
+                // right, the true side edge too) stay perfectly sharp for as
+                // long as the card is on screen -- that flush point is what
+                // reads as "grown from the corner" instead of "a card that
+                // happens to be nearby it." Every other corner uses freeR.
+                var rTL = 0, rTR = 0, rBL = freeR, rBR = freeR
+                if (corner === "right") { rTL = freeR; rTR = 0 }
+                else if (corner === "left") { rTL = 0; rTR = freeR }
+                // "center" leaves both top corners flush with the top edge --
+                // a flat-topped tab, like the shape is hanging from the edge
+                // itself rather than touching a corner point.
 
                 ctx.fillStyle = "#000000"
                 ctx.beginPath()
-                ctx.moveTo(left + r, top)
-                ctx.lineTo(right - r, top)
-                ctx.arcTo(right, top, right, top + r, r)
-                ctx.lineTo(right + belly, top + curH * 0.62)
-                ctx.quadraticCurveTo(right + belly, bottom - r * 0.4, right - r, bottom)
-                ctx.arcTo(right, bottom, right - r, bottom, r)
-                ctx.lineTo(left + r, bottom)
-                ctx.arcTo(left, bottom, left, bottom - r, r)
-                ctx.lineTo(left - belly, top + curH * 0.62)
-                ctx.quadraticCurveTo(left - belly, top + r * 0.4, left + r, top)
-                ctx.arcTo(left, top, left + r, top, r)
+                ctx.moveTo(left + rTL, top)
+                ctx.lineTo(right - rTR, top)
+                ctx.arcTo(right, top, right, top + rTR, rTR)
+                ctx.lineTo(right, bottom - rBR)
+                ctx.arcTo(right, bottom, right - rBR, bottom, rBR)
+                ctx.lineTo(left + rBL, bottom)
+                ctx.arcTo(left, bottom, left, bottom - rBL, rBL)
+                ctx.lineTo(left, top + rTL)
+                ctx.arcTo(left, top, left + rTL, top, rTL)
                 ctx.closePath()
                 ctx.fill()
               }
@@ -1192,6 +1283,10 @@ Item {
 
             NotificationCard {
               id: card
+              // cardSlot.Layout.preferredWidth is always exactly
+              // card.implicitWidth, so this never actually has room to
+              // shift -- kept simple (not corner-aware) rather than risking
+              // an "undefined" anchor assignment for no visible effect.
               anchors.right: parent.right
               app: cardSlot.app
               appIcon: cardSlot.appIcon
@@ -1207,10 +1302,13 @@ Item {
               // active theme. The history panel never sets this.
               popupMode: true
 
-              // Content (icon/text) only fades and pops in once the blob has
-              // mostly landed, so nothing looks stretched inside the neck.
+              // Content (icon/text) only fades and pops in once the shape is
+              // mostly at full size, so nothing looks stretched inside the
+              // small corner nub -- same formula on the way out, so content
+              // is already gone well before the shape shrinks small enough
+              // for it to look cramped.
               readonly property real settleP: Math.max(0, Math.min(1, (cardSlot.dripProgress - 0.55) / 0.45))
-              opacity: cardSlot.exiting ? Math.max(0, cardSlot.dripProgress) : settleP
+              opacity: settleP
               scale: 0.92 + 0.08 * settleP
 
               onCloseRequested: cardSlot.beginExit("dismiss")

@@ -252,23 +252,35 @@ function historyEntry(value, normalUrgency) {
   }
 }
 
-// notifications.json holds nothing but the last-set DND preference now that
-// history is a directory of files. Older versions kept `pending`/`past`
+// Valid values for the popup anchor corner setting. "right" is the default
+// -- it matches where toasts have always appeared and is the closest to a
+// real Dynamic Island's top-center-ish placement that still clears a
+// right-hand bar the way the original design intended.
+var POPUP_CORNERS = ["left", "center", "right"]
+
+function isValidPopupCorner(value) {
+  return POPUP_CORNERS.indexOf(value) !== -1
+}
+
+// notifications.json holds the last-set DND preference and popup corner now
+// that history is a directory of files. Older versions kept `pending`/`past`
 // (and, older still, `entries`) arrays in there; their presence is reported
 // so the service can rewrite the file without the dead payload.
 function parseSettings(raw) {
   var text = String(raw || "").trim()
-  if (!text) return { error: false, dnd: null, legacy: false }
+  if (!text) return { error: false, dnd: null, corner: null, legacy: false }
 
   try {
     var parsed = JSON.parse(text)
+    var corner = parsed && typeof parsed.corner === "string" ? parsed.corner : null
     return {
       error: false,
       dnd: parsed && typeof parsed.dnd === "boolean" ? parsed.dnd : null,
+      corner: isValidPopupCorner(corner) ? corner : null,
       legacy: !!(parsed && (parsed.pending || parsed.past || parsed.entries))
     }
   } catch (e) {
-    return { error: true, errorMessage: String(e), dnd: null, legacy: false }
+    return { error: true, errorMessage: String(e), dnd: null, corner: null, legacy: false }
   }
 }
 
@@ -474,6 +486,8 @@ if (typeof module !== "undefined") {
     serializePopup: serializePopup,
     parsePopupFiles: parsePopupFiles,
     popupExpired: popupExpired,
-    popupPlacement: popupPlacement
+    popupPlacement: popupPlacement,
+    isValidPopupCorner: isValidPopupCorner,
+    defaultPopupCorner: POPUP_CORNERS[POPUP_CORNERS.length - 1]
   }
 }
