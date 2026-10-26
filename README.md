@@ -1,5 +1,10 @@
 # Liquid Notifications
 
+> **Retired.** The [Notch](https://github.com/Kalinewb/omarchy-notch) now draws
+> notifications itself, and this plugin cannot run beside it: both replace
+> Omarchy's notification popups. It is kept here for the record and will not
+> be listed or updated.
+
 Pitch-black notification popups for Omarchy, always — regardless of your active
 theme — with a Dynamic-Island-style entrance animation instead of just popping
 into place.

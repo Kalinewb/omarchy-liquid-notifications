@@ -40,16 +40,13 @@ Item {
   // Corner radius is shared with the menu and shell panels.
   // It mirrors Hyprland's current decoration:rounding value.
   readonly property int cornerRadius: Style.cornerRadius
-  // Toasts are fixed to the top-right corner. They only clear the omarchy bar
-  // when the bar occupies the top or right edge, so left/bottom bars do not
-  // pull notification popups away from the expected top-right location.
-  // Falls back to the bar's default size (26 horizontal / 28 vertical) when
-  // shell.bar isn't reachable so the popup never lands on top of the bar.
-  readonly property string barPosition: shell && shell.barConfig ? String(shell.barConfig.position || "top") : "top"
-  readonly property bool barVertical: barPosition === "left" || barPosition === "right"
-  readonly property int defaultBarSize: barVertical ? Style.bar.sizeVertical : Style.bar.sizeHorizontal
-  readonly property int liveBarSize: shell && shell.bar && !shell.bar.barHidden ? Math.max(0, shell.bar.barSize) : defaultBarSize
-  readonly property int barClearance: liveBarSize + Style.gapsOut
+  // Toasts render on the Overlay layer, above the bar, and sit flush against
+  // the true physical screen edge on every side they touch -- zero margin,
+  // matching the flush-corner shape language, not a bar-clearance gap. This
+  // deliberately overlaps a top/left/right bar rather than leaving a gap
+  // below it: earlier revisions cleared the bar (or later, used a small
+  // Style.gapsOut gap) and both still read as "floating near the corner"
+  // instead of "in the actual corner" per live feedback with screenshots.
 
   // Live Notification objects by originalId, kept OUT of the ListModels: a
   // QObject stored in a model role becomes a dangling C++ pointer when the
@@ -1013,9 +1010,6 @@ Item {
       exclusionMode: ExclusionMode.Ignore
       color: "transparent"
 
-      readonly property var popupPlacement: NotificationLogic.popupPlacement(
-        service.barPosition, service.barClearance, Style.gapsOut)
-
       // Full-screen, fixed-size surface (like the OSD overlay). Adding or
       // removing a toast changes only the content inside; the Wayland surface
       // never resizes, so the compositor can't briefly scale a stale buffer --
@@ -1026,39 +1020,188 @@ Item {
       // rest of the (invisible) full-screen overlay never eats input.
       mask: Region { item: popupColumn }
 
+      // ---- Merged-shape open/close state ----
+      // One continuous OLED blob now holds every current toast as a "row"
+      // (see the Repeater below), rather than each toast drawing its own
+      // separate rounded card. openProgress is the container-level counterpart
+      // of the old per-card dripProgress: 0 = fully collapsed to a flush-
+      // corner nub (nothing on screen), 1 = fully open at the shape's real
+      // width. It only moves on the very first toast appearing (nub -> full
+      // width) and the very last one leaving (full width -> nub) -- adding or
+      // removing a row while the shape is already open never touches it, only
+      // the shape's HEIGHT changes then (see popupColumn.height below, which
+      // each row drives directly via its own growProgress).
+      property real openProgress: 0
+
+      NumberAnimation {
+        id: openAnim
+        target: popupWindow
+        property: "openProgress"
+        to: 1
+        duration: 420
+        easing.type: Easing.OutBack
+        easing.overshoot: 1.3
+      }
+
+      NumberAnimation {
+        id: closeAnim
+        target: popupWindow
+        property: "openProgress"
+        to: 0
+        duration: 220
+        easing.type: Easing.InOutCubic
+      }
+
+      // Called by a row's Component.onCompleted. A no-op once already fully
+      // open (or opening) so a 2nd/3rd toast arriving doesn't yank
+      // openProgress back to 0 and re-run the nub pop for no reason -- only
+      // the row itself grows in that case. Reverses an in-flight close (a
+      // fresh toast arriving while the last one is mid-exit) smoothly from
+      // wherever openProgress currently sits, since neither animation sets an
+      // explicit `from`.
+      function openMergedShape() {
+        if (popupWindow.openProgress >= 0.999 && !closeAnim.running) return
+        closeAnim.stop()
+        openAnim.restart()
+      }
+
+      // Called by a row's beginExit() only when it is the LAST remaining
+      // popup, so the whole shape shrinks back into its nub in lockstep with
+      // that row's own fade -- not on every dismissal, which would wrongly
+      // collapse the shared shape while sibling rows are still on screen.
+      function closeMergedShape() {
+        openAnim.stop()
+        closeAnim.restart()
+      }
+
+      // Pitch-black backdrop for every current toast row, drawn ONCE behind
+      // the whole column rather than once per card -- this is what makes
+      // multiple toasts read as a single continuous "OLED blob" instead of a
+      // stack of separate pills with gaps between them. Geometry always
+      // matches popupColumn exactly (same x/y/width/height), and it repaints
+      // whenever that geometry changes -- which happens continuously while
+      // rows grow/shrink, since popupColumn's real height is just the live
+      // sum of its children's (animated) implicitHeight.
+      Canvas {
+        id: mergedShape
+        z: -1
+        x: popupColumn.x
+        y: popupColumn.y
+        width: popupColumn.width
+        height: popupColumn.height
+
+        property real op: popupWindow.openProgress
+        onOpChanged: requestPaint()
+        onWidthChanged: requestPaint()
+        onHeightChanged: requestPaint()
+
+        onPaint: {
+          var ctx = getContext("2d")
+          ctx.clearRect(0, 0, width, height)
+          var w = width
+          var h = height
+          if (w <= 0 || h <= 0) return
+
+          // Width only ever moves during the open/close transition (see
+          // openProgress above); height tracks the column's real, live
+          // height directly -- each row's own grow/shrink animation already
+          // smooths it, so no separate easing is applied to it here (doing
+          // so would double-ease and make the shape wobble oddly whenever a
+          // row is added to or removed from an already-open stack).
+          var opClamped = Math.max(0, Math.min(1, popupWindow.openProgress))
+          var minNub = Math.min(24, w)
+          var curW = minNub + (w - minNub) * opClamped
+          var curH = Math.max(minNub, h)
+
+          var finalR = Math.max(0, service.cornerRadius)
+          var capsuleR = Math.min(curW, curH) / 2
+          var freeR = capsuleR + (finalR - capsuleR) * Math.pow(opClamped, 2.2)
+          freeR = Math.max(0, Math.min(freeR, curW / 2, curH / 2))
+
+          var corner = service.popupCorner
+          var top = 0
+          var bottom = curH
+          var left, right
+          if (corner === "center") {
+            var cx = w / 2
+            left = cx - curW / 2
+            right = cx + curW / 2
+          } else if (corner === "left") {
+            left = 0
+            right = curW
+          } else {
+            right = w
+            left = right - curW
+          }
+
+          // The corner(s) touching the true top edge (and, for left/right,
+          // the true side edge too) stay perfectly sharp for as long as the
+          // shape is on screen -- that flush point is what reads as "grown
+          // from the corner" instead of "a shape that happens to be nearby
+          // it." Every other corner uses freeR.
+          var rTL = 0, rTR = 0, rBL = freeR, rBR = freeR
+          if (corner === "right") { rTL = freeR; rTR = 0 }
+          else if (corner === "left") { rTL = 0; rTR = freeR }
+          // "center" leaves both top corners flush with the top edge -- a
+          // flat-topped tab, like the shape is hanging from the edge itself
+          // rather than touching a corner point.
+
+          ctx.fillStyle = "#000000"
+          ctx.beginPath()
+          ctx.moveTo(left + rTL, top)
+          ctx.lineTo(right - rTR, top)
+          ctx.arcTo(right, top, right, top + rTR, rTR)
+          ctx.lineTo(right, bottom - rBR)
+          ctx.arcTo(right, bottom, right - rBR, bottom, rBR)
+          ctx.lineTo(left + rBL, bottom)
+          ctx.arcTo(left, bottom, left, bottom - rBL, rBL)
+          ctx.lineTo(left, top + rTL)
+          ctx.arcTo(left, top, left + rTL, top, rTL)
+          ctx.closePath()
+          ctx.fill()
+        }
+      }
+
       ColumnLayout {
         id: popupColumn
         anchors.top: parent.top
-        anchors.topMargin: popupWindow.popupPlacement.margins.top
+        // Flush against the TRUE physical top edge -- zero margin. This
+        // renders on the Overlay layer, above a top/left/right bar, by
+        // design: any margin here (even a small Style.gapsOut one, tried
+        // previously) still reads as "floating near the corner" rather than
+        // "in the actual corner" per live feedback with screenshots, twice.
+        anchors.topMargin: 0
         // Horizontal position is driven by service.popupCorner (left/center/
         // right, user-configurable -- see Service.setPopupCorner) rather
-        // than a fixed anchors.right, so the whole stack -- and each card's
-        // Dynamic-Island-style growth corner below -- can move to any edge.
+        // than a fixed anchors.right, so the whole stack -- and the merged
+        // shape's flush growth corner above -- can move to any edge. Flush
+        // against that side's true physical edge too, for the same reason
+        // as the top margin: zero, not Style.gapsOut.
         // ColumnLayout doesn't bind its own width to implicitWidth when it
         // isn't filling its parent on both sides, so that's set explicitly.
         width: implicitWidth
         x: {
-          if (service.popupCorner === "left") return popupWindow.popupPlacement.margins.left
+          if (service.popupCorner === "left") return 0
           if (service.popupCorner === "center") return Math.round((popupWindow.width - width) / 2)
-          return popupWindow.width - width - popupWindow.popupPlacement.margins.right
+          return popupWindow.width - width
         }
-        spacing: Style.space(8)
+        // No inter-row spacing: rows now merge into one shape, separated by
+        // a hairline divider drawn inside each row rather than a gap between
+        // independent cards (see the Repeater delegate below).
+        spacing: 0
 
         Repeater {
           model: popupModel
 
-          // The delegate is a slot Item that owns lifetime timer state and the
-          // entrance/exit animation. The Canvas paints a Dynamic-Island-style
-          // shape: it grows outward from a fixed, flush corner of the card's
-          // own footprint (see service.popupCorner) rather than falling,
-          // dripping, or oozing in from somewhere else -- that corner reads
-          // as part of the screen edge itself, never moving, never rounded,
-          // for as long as the card is on screen. On exit it shrinks back
-          // down into that same corner. The real NotificationCard
-          // (popupMode: true, so it renders pitch black regardless of the
-          // active theme) fades in once the shape is mostly at full size.
-          // The history panel instantiates NotificationCard directly and
-          // never runs any of this -- only the live popup toast does.
+          // The delegate is a ROW inside the one shared, merged shape drawn
+          // by mergedShape above -- not an independent card anymore. It
+          // still owns everything per-toast that always lived here (lifetime
+          // timer, hover-pause, dismiss/expire/invoke, content-refresh reset)
+          // -- only the VISUAL container changed from "one canvas + one card
+          // per delegate" to "one canvas for the whole column, one
+          // transparent content row per delegate." Newest toast is index 0
+          // (top of the column, nearest the flush corner); every row below
+          // it draws a hairline divider against the one above.
           delegate: Item {
             id: cardSlot
             required property int index
@@ -1072,67 +1215,61 @@ Item {
             required property double expireTimeout
             required property double timestamp
 
-            // Each card sizes itself based on mode (text vs media); the slot
-            // tracks the card so the column auto-fits to whichever is widest.
-            // Alignment within that shared width follows the same corner as
-            // the column's own position (a narrower card in a "left" stack
-            // hugs the left edge, not the right).
+            // A divider above every row except the topmost -- it separates
+            // this row from its neighbor instead of a gap between separate
+            // cards, so multiple toasts read as rows in one blob.
+            readonly property real dividerHeight: cardSlot.index > 0 ? Style.hairline : 0
+            readonly property real fullContentHeight: cardSlot.dividerHeight + card.implicitHeight
+
             Layout.preferredWidth: card.implicitWidth
-            Layout.alignment: service.popupCorner === "left" ? Qt.AlignLeft
-              : service.popupCorner === "center" ? Qt.AlignHCenter : Qt.AlignRight
-            implicitHeight: card.implicitHeight
+            implicitWidth: card.implicitWidth
+            // The row's real (Layout-visible) height is what actually drives
+            // the merged shape's height -- see mergedShape's `height:
+            // popupColumn.height` binding above. Growing/shrinking THIS,
+            // rather than leaving it constant and only faking the shrink
+            // visually (the old single-card design's trick), is what makes
+            // the shared shape smoothly grow/shrink around a row being added
+            // or removed while siblings stay put, instead of holding size
+            // until the row disappears and then snapping.
+            implicitHeight: cardSlot.fullContentHeight * cardSlot.growProgress
+            // Reveals the row (divider + card) from the top down as it
+            // grows, and crops it the same way on the way out, rather than
+            // letting the fixed-size content poke out past its own
+            // currently-animated slot height.
+            clip: true
 
             readonly property real lifetime: service.durationFor(cardSlot.urgency, cardSlot.expireTimeout)
             property real remainingLifetime: 1.0
             readonly property bool ticking: cardSlot.lifetime > 0 && !card.hovered && !cardSlot.exiting
 
-            // ---- Dynamic-Island-style entrance/exit state ----
-            // dripProgress: 0 = collapsed to nothing at the anchor corner,
-            // 1 = fully expanded and settled. The corner itself (whichever
-            // one service.popupCorner picks) never moves -- the shape grows
-            // outward from it, like that corner of the screen is what's
-            // expanding, and shrinks back into it on the way out. Kept the
-            // name dripProgress rather than renaming it -- it is still the
-            // single progress value driving the shape in Canvas below, this
-            // plugin's history just went through a few design passes on top
-            // of it (literal drip -> connected icicle -> oozing extrusion ->
-            // Dynamic Island) before landing here.
-            property real dripProgress: 0
+            // ---- per-row entrance/exit state ----
+            // growProgress: 0 = collapsed to nothing (no height at all), 1 =
+            // fully grown and settled. This is the per-row counterpart of
+            // popupWindow.openProgress above -- that one nub-grows the
+            // SHARED shape's width on the very first/last toast; this one
+            // grows THIS row's height, every time, whether it's the first
+            // toast opening the whole shape or the third one slotting into
+            // an already-open one.
+            property real growProgress: 0
             property bool exiting: false
             property string pendingAction: "dismiss"
-            // Delay the y-reposition Behavior until after first layout, so a
-            // freshly-inserted card doesn't visibly slide in from (0,0) on
-            // top of its own drip animation.
-            property bool placed: false
 
             Component.onCompleted: {
-              enterAnim.start()
-              Qt.callLater(function() { cardSlot.placed = true })
+              rowEnterAnim.start()
+              // No-op if the shape is already open -- only actually pops the
+              // nub open for the first toast; every later one just grows its
+              // own row into the already-full-width shape.
+              popupWindow.openMergedShape()
             }
 
-            // Smoothly slides older toasts down (or up, once one above them
-            // is dismissed) instead of snapping when the stack changes.
-            Behavior on y {
-              enabled: cardSlot.placed
-              NumberAnimation { duration: 220; easing.type: Easing.OutCubic }
-            }
-
-            // A fast, slightly springy expand -- like iOS's Dynamic Island,
-            // not a bouncy water-droplet wobble (the original design's
-            // OutElastic landing bounce read as a cartoon liquid-physics
-            // gag) and not a slow, heavily-eased drift either. OutBack with
-            // a modest overshoot gives exactly that: a quick expand that
-            // slightly overshoots its final size and settles, all inside
-            // ~420ms -- long enough to be genuinely visible (unlike the
-            // original's OutCubic, which front-loaded ~90% of its motion
-            // into the first ~100ms of an 800ms duration, so a burst of
-            // ~90ms-apart screenshots only ever caught "before" and
-            // "after") without the old design's much longer 800ms hang time,
-            // which no longer suits a snappy corner-grown shape.
+            // Same fast, slightly springy expand as the shape's own open
+            // animation (see popupWindow.openAnim) -- a quick grow that
+            // slightly overshoots and settles inside ~420ms, long enough to
+            // be genuinely visible frame-to-frame rather than front-loaded.
             NumberAnimation {
-              id: enterAnim
+              id: rowEnterAnim
               target: cardSlot
-              property: "dripProgress"
+              property: "growProgress"
               from: 0
               to: 1
               duration: 420
@@ -1140,12 +1277,12 @@ Item {
               easing.overshoot: 1.3
             }
 
-            // Contracting back to the corner is a plain, un-springy ease --
-            // the reverse of the expand, not a bounce on the way in.
+            // Contracting is a plain, un-springy ease -- the reverse of the
+            // grow, not a bounce on the way in.
             NumberAnimation {
-              id: exitAnim
+              id: rowExitAnim
               target: cardSlot
-              property: "dripProgress"
+              property: "growProgress"
               to: 0
               duration: 220
               easing.type: Easing.InOutCubic
@@ -1166,7 +1303,11 @@ Item {
               if (cardSlot.exiting) return
               cardSlot.exiting = true
               cardSlot.pendingAction = action
-              exitAnim.start()
+              // Only shrink the SHARED shape's width back to a nub when this
+              // is the last row standing -- otherwise sibling rows are still
+              // showing and the shape must stay fully open, just shorter.
+              if (popupModel.count === 1) popupWindow.closeMergedShape()
+              rowExitAnim.start()
             }
 
             // A client updating this notification in place rewrites the row
@@ -1193,92 +1334,29 @@ Item {
               }
             }
 
-            // Pitch-black Dynamic-Island-style shape: grows outward from a
-            // fixed, flush corner of the card's own footprint -- the corner
-            // matching service.popupCorner (top-right by default, so the
-            // shape's top-right point never moves and has no corner radius
-            // of its own, reading as if that corner of the screen is what's
-            // expanding) rather than a card falling into place from
-            // somewhere else. The other corners round from a small pill/dot
-            // at rest size up to the card's real corner radius as it grows.
-            // Always a literal #000000 fill -- never a theme token -- so it
-            // can never pick up whatever the active Omarchy theme happens to
-            // be. Left permanently underneath the card (rather than toggled
-            // via `visible`) so there is nothing to flicker once the two
-            // shapes converge -- the card simply fades in on top of it.
-            Canvas {
-              id: dripCanvas
-              anchors.fill: parent
+            // Content (icon/text, and the divider below) only fades and pops
+            // in once the row is mostly at full height, so nothing looks
+            // stretched while still growing -- same formula on the way out,
+            // so content is already gone well before the row shrinks small
+            // enough to look cramped. Mirrors the old single-card settleP.
+            readonly property real settleP: Math.max(0, Math.min(1, (cardSlot.growProgress - 0.55) / 0.45))
 
-              property real p: cardSlot.dripProgress
-              onPChanged: requestPaint()
-              onWidthChanged: requestPaint()
-              onHeightChanged: requestPaint()
-
-              onPaint: {
-                var ctx = getContext("2d")
-                ctx.clearRect(0, 0, width, height)
-                var w = width
-                var h = height
-                if (w <= 0 || h <= 0) return
-                // Entrance can overshoot slightly past 1 (OutBack's spring);
-                // clamp the drawn size at the card's actual footprint so
-                // that pop reads as a spring in the corner radius/timing
-                // rather than spilling outside the card's own allocated
-                // space. Exit never goes below 0.
-                var sizeP = Math.max(0, Math.min(1, p))
-                var minNub = Math.min(24, w, h)
-                var curW = minNub + (w - minNub) * sizeP
-                var curH = minNub + (h - minNub) * sizeP
-                if (curW <= 0.5 || curH <= 0.5) return
-
-                var finalR = Math.max(0, service.cornerRadius)
-                var capsuleR = Math.min(curW, curH) / 2
-                var freeR = capsuleR + (finalR - capsuleR) * Math.pow(sizeP, 2.2)
-                freeR = Math.max(0, Math.min(freeR, curW / 2, curH / 2))
-
-                var corner = service.popupCorner
-                var top = 0
-                var bottom = curH
-                var left, right
-                if (corner === "center") {
-                  var cx = w / 2
-                  left = cx - curW / 2
-                  right = cx + curW / 2
-                } else if (corner === "left") {
-                  left = 0
-                  right = curW
-                } else {
-                  right = w
-                  left = right - curW
-                }
-
-                // The corner(s) touching the true top edge (and, for left/
-                // right, the true side edge too) stay perfectly sharp for as
-                // long as the card is on screen -- that flush point is what
-                // reads as "grown from the corner" instead of "a card that
-                // happens to be nearby it." Every other corner uses freeR.
-                var rTL = 0, rTR = 0, rBL = freeR, rBR = freeR
-                if (corner === "right") { rTL = freeR; rTR = 0 }
-                else if (corner === "left") { rTL = 0; rTR = freeR }
-                // "center" leaves both top corners flush with the top edge --
-                // a flat-topped tab, like the shape is hanging from the edge
-                // itself rather than touching a corner point.
-
-                ctx.fillStyle = "#000000"
-                ctx.beginPath()
-                ctx.moveTo(left + rTL, top)
-                ctx.lineTo(right - rTR, top)
-                ctx.arcTo(right, top, right, top + rTR, rTR)
-                ctx.lineTo(right, bottom - rBR)
-                ctx.arcTo(right, bottom, right - rBR, bottom, rBR)
-                ctx.lineTo(left + rBL, bottom)
-                ctx.arcTo(left, bottom, left, bottom - rBL, rBL)
-                ctx.lineTo(left, top + rTL)
-                ctx.arcTo(left, top, left + rTL, top, rTL)
-                ctx.closePath()
-                ctx.fill()
-              }
+            // Hairline separator from the row above. Purely decorative --
+            // subtle low-opacity white against the pitch-black shared shape,
+            // never a bright element competing with the text -- and it
+            // fades with this row's own grow/shrink so it never lingers as
+            // an orphaned line when a neighbor is removed or a new one
+            // slots in above it (which is also why its own presence isn't
+            // separately animated when `index` itself changes -- it just
+            // rides whichever row it belongs to).
+            Rectangle {
+              anchors.top: parent.top
+              anchors.left: parent.left
+              anchors.right: parent.right
+              height: Style.hairline
+              color: "#FFFFFF"
+              opacity: cardSlot.index > 0 ? cardSlot.settleP * 0.14 : 0
+              visible: cardSlot.index > 0
             }
 
             NotificationCard {
@@ -1287,6 +1365,8 @@ Item {
               // card.implicitWidth, so this never actually has room to
               // shift -- kept simple (not corner-aware) rather than risking
               // an "undefined" anchor assignment for no visible effect.
+              anchors.top: parent.top
+              anchors.topMargin: cardSlot.dividerHeight
               anchors.right: parent.right
               app: cardSlot.app
               appIcon: cardSlot.appIcon
@@ -1298,18 +1378,20 @@ Item {
               cornerRadius: service.cornerRadius
               fontFamily: service.shell && service.shell.bar ? service.shell.bar.fontFamily : ""
               glyph: cardSlot.glyph
-              // Popup-only: pitch-black background/text, independent of the
-              // active theme. The history panel never sets this.
+              // Popup-only: pitch-black text/icon palette, independent of
+              // the active theme. The history panel never sets this.
               popupMode: true
+              // This row paints no background/border/radius/clip of its
+              // own -- mergedShape (above) is the one continuous shape
+              // behind every row, so a per-row surface here would draw a
+              // second, redundant rounded box under the text and defeat the
+              // whole point of merging. The history panel never sets this
+              // either, so its independent per-entry card rendering (its
+              // own black-ish/themed rounded box) is untouched.
+              flatMode: true
 
-              // Content (icon/text) only fades and pops in once the shape is
-              // mostly at full size, so nothing looks stretched inside the
-              // small corner nub -- same formula on the way out, so content
-              // is already gone well before the shape shrinks small enough
-              // for it to look cramped.
-              readonly property real settleP: Math.max(0, Math.min(1, (cardSlot.dripProgress - 0.55) / 0.45))
-              opacity: settleP
-              scale: 0.92 + 0.08 * settleP
+              opacity: cardSlot.settleP
+              scale: 0.92 + 0.08 * cardSlot.settleP
 
               onCloseRequested: cardSlot.beginExit("dismiss")
               onCardClicked: cardSlot.beginExit("invoke")

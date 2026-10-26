@@ -35,6 +35,16 @@ BorderSurface {
   // The history panel never sets this, so its rendering is untouched.
   property bool popupMode: false
 
+  // Set only by the live popup toast, alongside popupMode, once multiple
+  // toasts merge into a single shared shape (see Service.qml's mergedShape
+  // Canvas): suppresses THIS card's own background fill, border, corner
+  // radius, and clip, so it contributes only text/icon content and never
+  // paints a second, redundant rounded box on top of the one shared shape
+  // drawn behind every row. Independent of popupMode, which still controls
+  // the pitch-black text/icon palette either way. The history panel never
+  // sets this, so its own independent per-entry card rendering is untouched.
+  property bool flatMode: false
+
   readonly property bool hovered: hoverTracker.hovered
 
   signal closeRequested()
@@ -89,10 +99,10 @@ BorderSurface {
   // Add vertical border insets so mainColumn (inset by border on top/left/right)
   // doesn't push content under the bottom edge.
   implicitHeight: mainColumn.implicitHeight + borderTop + borderBottom
-  radius: cornerRadius
-  color: root.displayBackground
-  borderSpec: cardBorderSpec
-  clip: true
+  radius: flatMode ? 0 : cornerRadius
+  color: flatMode ? "transparent" : root.displayBackground
+  borderSpec: flatMode ? Border.none() : cardBorderSpec
+  clip: !flatMode
 
   HoverHandler { id: hoverTracker }
 
